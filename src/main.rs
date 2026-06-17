@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use clap::Parser;
+use indicatif::{ProgressBar, ProgressStyle};
 use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -28,8 +29,22 @@ struct GooglePhotoMetadata {
     photo_taken_time: GoogleTime,
     #[serde(default, rename = "geoData")]
     geo_data: GeoData,
+    #[serde(default, rename = "geoDataExif")]
+    geo_data_exif: GeoData,
     #[serde(default)]
     url: Option<String>,
+}
+
+impl GooglePhotoMetadata {
+    fn gps_data(&self) -> Option<&GeoData> {
+        if self.geo_data_exif.has_coordinates() {
+            Some(&self.geo_data_exif)
+        } else if self.geo_data.has_coordinates() {
+            Some(&self.geo_data)
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -53,6 +68,12 @@ struct GeoData {
     _longitude_span: Option<f64>,
 }
 
+impl GeoData {
+    fn has_coordinates(&self) -> bool {
+        self.latitude != 0.0 || self.longitude != 0.0
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct MetadataTitle {
     title: String,
@@ -72,44 +93,63 @@ fn main() -> Result<()> {
     })?;
 
     let (media_files, json_files) = list_files(&args.input)?;
-    let mut processed = 0;
+    let progress = ProgressBar::new(media_files.len() as u64);
+    progress.set_style(
+        ProgressStyle::with_template(
+            "[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {percent}% {wide_msg}",
+        )
+        .context("template de barre d'avancement invalide")?
+        .progress_chars("=>-"),
+    );
+
+    let mut copied = 0;
+    let mut metadata_written = 0;
+    let mut metadata_errors = 0;
+    let mut copy_errors = 0;
     let mut skipped = 0;
 
     for media_path in media_files {
         let media_name = file_name_string(&media_path)?;
+        progress.set_message(media_name.clone());
 
         let Some(json_path) = find_json_for_media(&media_path, &json_files)? else {
-            eprintln!("aucun JSON trouve pour {}", media_name);
             skipped += 1;
+            progress.inc(1);
             continue;
         };
 
         let output_media_path = args.output.join(&media_name);
-        fs::copy(&media_path, &output_media_path).with_context(|| {
-            format!(
-                "impossible de copier {} vers {}",
-                media_path.display(),
-                output_media_path.display()
-            )
-        })?;
+        if fs::copy(&media_path, &output_media_path).is_err() {
+            copy_errors += 1;
+            progress.inc(1);
+            continue;
+        }
 
-        println!(
-            "l'image {} va avec le json {}",
-            media_name,
-            json_path.display()
-        );
+        copied += 1;
 
-        write_metadata(&output_media_path, &json_path).with_context(|| {
-            format!(
-                "impossible d'ecrire les metadata de {}",
-                output_media_path.display()
-            )
-        })?;
+        match write_metadata(&output_media_path, &json_path) {
+            Ok(()) => metadata_written += 1,
+            Err(_) => {
+                metadata_errors += 1;
 
-        processed += 1;
+                if fs::copy(&media_path, &output_media_path).is_err() {
+                    copy_errors += 1;
+                }
+            }
+        }
+
+        progress.inc(1);
     }
 
-    println!("{} fichier(s) traite(s), {} ignore(s)", processed, skipped);
+    progress.finish_and_clear();
+
+    let total_errors = metadata_errors + copy_errors;
+    println!("{copied} fichier(s) copie(s)");
+    println!("{metadata_written} fichier(s) avec metadata");
+    println!("{skipped} fichier(s) ignore(s) sans JSON");
+    println!("{total_errors} erreur(s)");
+    println!("{metadata_errors} erreur(s) metadata");
+    println!("{copy_errors} erreur(s) copie");
 
     Ok(())
 }
@@ -217,25 +257,26 @@ fn write_metadata(media_path: &Path, json_path: &Path) -> Result<()> {
         args.push(format!("-XMP:DateCreated={}", taken_date));
         args.push(format!("-XMP:CreateDate={}", creation_date));
 
-        add_gps_args(&mut args, &metadata.geo_data, "GPS");
+        if let Some(geo_data) = metadata.gps_data() {
+            add_image_gps_args(&mut args, geo_data);
+        }
     } else if is_png(media_path) {
         args.push(format!("-PNG:Description={}", metadata.description));
         args.push(format!("-PNG:CreationTime={}", taken_date));
         args.push(format!("-XMP:DateCreated={}", taken_date));
         args.push(format!("-XMP:CreateDate={}", creation_date));
 
-        add_gps_args(&mut args, &metadata.geo_data, "GPS");
+        if let Some(geo_data) = metadata.gps_data() {
+            add_image_gps_args(&mut args, geo_data);
+        }
     } else if is_mp4(media_path) {
         args.push(format!("-QuickTime:Title={}", metadata.title));
         args.push(format!("-QuickTime:Description={}", metadata.description));
         args.push(format!("-QuickTime:CreateDate={}", taken_date));
         args.push(format!("-QuickTime:ModifyDate={}", creation_date));
 
-        if has_gps(&metadata.geo_data) {
-            args.push(format!(
-                "-QuickTime:GPSCoordinates={} {}",
-                metadata.geo_data.latitude, metadata.geo_data.longitude
-            ));
+        if let Some(geo_data) = metadata.gps_data() {
+            add_mp4_gps_args(&mut args, geo_data);
         }
     } else {
         anyhow::bail!("format non supporte : {:?}", media_path);
@@ -255,23 +296,38 @@ fn write_metadata(media_path: &Path, json_path: &Path) -> Result<()> {
         );
     }
 
-    print!("{}", String::from_utf8_lossy(&output.stdout));
-
     Ok(())
 }
 
-fn add_gps_args(args: &mut Vec<String>, geo_data: &GeoData, prefix: &str) {
-    if !has_gps(geo_data) {
-        return;
-    }
+fn add_image_gps_args(args: &mut Vec<String>, geo_data: &GeoData) {
+    let latitude_ref = if geo_data.latitude < 0.0 { "S" } else { "N" };
+    let longitude_ref = if geo_data.longitude < 0.0 { "W" } else { "E" };
+    let altitude_ref = if geo_data.altitude < 0.0 {
+        "Below Sea Level"
+    } else {
+        "Above Sea Level"
+    };
 
-    args.push(format!("-{prefix}:GPSLatitude={}", geo_data.latitude));
-    args.push(format!("-{prefix}:GPSLongitude={}", geo_data.longitude));
-    args.push(format!("-{prefix}:GPSAltitude={}", geo_data.altitude));
+    args.push(format!("-EXIF:GPSLatitude={}", geo_data.latitude.abs()));
+    args.push(format!("-EXIF:GPSLatitudeRef={latitude_ref}"));
+    args.push(format!("-EXIF:GPSLongitude={}", geo_data.longitude.abs()));
+    args.push(format!("-EXIF:GPSLongitudeRef={longitude_ref}"));
+    args.push(format!("-EXIF:GPSAltitude={}", geo_data.altitude.abs()));
+    args.push(format!("-EXIF:GPSAltitudeRef={altitude_ref}"));
 }
 
-fn has_gps(geo_data: &GeoData) -> bool {
-    geo_data.latitude != 0.0 || geo_data.longitude != 0.0
+fn add_mp4_gps_args(args: &mut Vec<String>, geo_data: &GeoData) {
+    let coordinates = iso_6709_coordinates(geo_data);
+
+    args.push(format!("-Keys:GPSCoordinates={coordinates}"));
+    args.push(format!("-UserData:GPSCoordinates={coordinates}"));
+}
+
+fn iso_6709_coordinates(geo_data: &GeoData) -> String {
+    format!(
+        "{:+010.6}{:+011.6}{:+.3}/",
+        geo_data.latitude, geo_data.longitude, geo_data.altitude
+    )
 }
 
 fn is_supported_media(path: &Path) -> bool {
